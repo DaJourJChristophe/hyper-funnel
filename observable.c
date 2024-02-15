@@ -337,17 +337,21 @@ struct observable
   observer_t **observers;
   size_t max_observers;
   uint64_t count;
+  pthread_t *tids;
+  size_t max_threads;
 };
 
 typedef struct observable observable_t;
 
-observable_t *observable_new(const size_t cap, const size_t max_observers)
+observable_t *observable_new(const size_t cap, const size_t max_observers, const size_t max_threads)
 {
   observable_t *self = NULL;
   self = (observable_t *)calloc(1, sizeof(*self));
   self->queue = ts_queue_new(cap);
+  self->tids = (pthread_t *)calloc(max_threads, sizeof(*self->tids));
   self->observers = (observer_t **)calloc(max_observers, sizeof(*self->observers));
   self->max_observers = max_observers;
+  self->max_threads;
   self->cap;
   return self;
 }
@@ -359,6 +363,12 @@ void observable_destroy(observable_t *self)
     if (self->queue != NULL)
     {
       ts_queue_destroy(self->queue);
+    }
+
+    if (self->tids != NULL)
+    {
+      free(self->tids);
+      self->tids = NULL;
     }
 
     if (self->observers != NULL)
@@ -381,6 +391,23 @@ void observable_destroy(observable_t *self)
   }
 }
 
+void observable_init(observable_t *self)
+{
+  if (self == NULL)
+  {
+    return;
+  }
+
+  observer_t *observer = NULL;
+  uint64_t i;
+
+  for (i = 0; i < self->count; i++)
+  {
+    observer = self->observers[i];
+    pthread_create(&self->tids[i], NULL, observer->notify, observer);
+  }
+}
+
 bool observable_publish(observable_t *self, const int item)
 {
   if (self == NULL)
@@ -388,27 +415,10 @@ bool observable_publish(observable_t *self, const int item)
     return false;
   }
 
-  pthread_t tids[self->count];
-  memset(tids, 0, self->count * sizeof(*tids));
-
-  observer_t *observer = NULL;
-  uint64_t i;
-
   if (false == ts_queue_enqueue(self->queue, item))
   {
     fprintf(stderr, "%s(): %s\n", __func__, "could not enqueue item");
     return false;
-  }
-
-  for (i = 0; i < self->count; i++)
-  {
-    observer = self->observers[i];
-    pthread_create(&tids[i], NULL, observer->notify, observer);
-  }
-
-  for (i = 0; i < self->count; i++)
-  {
-    pthread_join(tids[i], NULL);
   }
 
   return true;
@@ -435,10 +445,13 @@ void *notifier1(void *args)
   observer_t *observer = (observer_t *)args;
   int *item = NULL;
 
-  while (NULL != (item = ts_queue_dequeue(observer->observable->queue)))
+  while (true)
   {
-    printf("%d\n", *item);
-    sleep(1.0);
+    while (NULL != (item = ts_queue_dequeue(observer->observable->queue)))
+    {
+      printf("%d\n", *item);
+      sleep(0.1);
+    }
   }
 
   return NULL;
@@ -449,9 +462,12 @@ void *notifier2(void *args)
   observer_t *observer = (observer_t *)args;
   int *item = NULL;
 
-  while (NULL != (item = ts_queue_dequeue(observer->observable->queue)))
+  while (true)
   {
-    printf("%d\n", *item);
+    while (NULL != (item = ts_queue_dequeue(observer->observable->queue)))
+    {
+      printf("%d\n", *item);
+    }
   }
 
   return NULL;
@@ -463,7 +479,7 @@ int main(void)
   observer_t *observer2 = NULL;
 
   observable_t *observable = NULL;
-  observable = observable_new(10, 5);
+  observable = observable_new(10, 5, 2);
 
   observer1 = observer_new(observable, &notifier1);
   observer2 = observer_new(observable, &notifier2);
@@ -471,11 +487,18 @@ int main(void)
   observable_subscribe(observable, observer1);
   observable_subscribe(observable, observer2);
 
+  observable_init(observable);
+
   int i;
 
   for (i = 1; i < 6; i++)
   {
     observable_publish(observable, i);
+  }
+
+  for (i = 0; i < observable->count; i++)
+  {
+    pthread_join(observable->tids[i], NULL);
   }
 
   observable_destroy(observable);
