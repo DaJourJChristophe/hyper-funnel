@@ -206,14 +206,13 @@ int *ts_queue_dequeue(ts_queue_t *self)
   }
 
   const uint64_t w = atomic_load(&self->w);
-  const uint64_t r = atomic_load(&self->r);
+  const uint64_t r = atomic_fetch_add(&self->r, 1UL);
 
   if (r == w)
   {
+    atomic_exchange(&self->r, r);
     return NULL;
   }
-
-  atomic_fetch_add(&self->r, 1UL);
 
   int *item = NULL;
   item = (int *)calloc(1, sizeof(*item));
@@ -289,6 +288,7 @@ bool ts_queue_empty(ts_queue_t *self)
   return 0UL == (w - r);
 }
 
+#include <stdatomic.h>
 #include <inttypes.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -339,6 +339,8 @@ struct observable
   uint64_t count;
   pthread_t *tids;
   size_t max_threads;
+  atomic_bool done;
+  atomic_bool ready;
 };
 
 typedef struct observable observable_t;
@@ -350,6 +352,10 @@ observable_t *observable_new(const size_t cap, const size_t max_observers, const
   self->queue = ts_queue_new(cap);
   self->tids = (pthread_t *)calloc(max_threads, sizeof(*self->tids));
   self->observers = (observer_t **)calloc(max_observers, sizeof(*self->observers));
+
+  atomic_init(&self->done, false);
+  atomic_init(&self->ready, false);
+
   self->max_observers = max_observers;
   self->max_threads;
   self->cap;
@@ -404,7 +410,79 @@ void observable_init(observable_t *self)
   for (i = 0; i < self->count; i++)
   {
     observer = self->observers[i];
-    pthread_create(&self->tids[i], NULL, observer->notify, observer);
+
+    if (pthread_create(&self->tids[i], NULL, observer->notify, observer) < 0)
+    {
+      fprintf(stderr, "%s(): %s\n", __func__, "could not create thread");
+      exit(EXIT_FAILURE);
+    }
+  }
+}
+
+void observable_select(observable_t *self)
+{
+  if (self == NULL)
+  {
+    return;
+  }
+loop:
+  if (true == atomic_load(&self->ready) ||
+      true == atomic_load(&self->done))
+  {
+    goto done;
+  }
+  goto loop;
+done:
+  return;
+}
+
+void observable_clear(observable_t *self)
+{
+  if (self == NULL)
+  {
+    return;
+  }
+
+  atomic_store(&self->ready, false);
+}
+
+void observable_wait(observable_t *self)
+{
+  if (self == NULL)
+  {
+    return;
+  }
+
+  uint64_t i;
+
+  for (i = 0; i < self->count; i++)
+  {
+    if (pthread_join(self->tids[i], NULL) < 0)
+    {
+      fprintf(stderr, "%s(): %s\n", __func__, "could not join thread");
+      exit(EXIT_FAILURE);
+    }
+  }
+}
+
+void observable_shutdown(observable_t *self)
+{
+  if (self == NULL)
+  {
+    return;
+  }
+
+  uint64_t i;
+
+  atomic_store(&self->done, true);
+
+  for (i = 0; i < self->count; i++)
+  {
+    if (pthread_join(self->tids[i], NULL) < 0)
+    {
+      fprintf(stderr, "%s(): %s\n", __func__, "could not join thread");
+      exit(EXIT_FAILURE);
+    }
   }
 }
 
@@ -420,6 +498,8 @@ bool observable_publish(observable_t *self, const int item)
     fprintf(stderr, "%s(): %s\n", __func__, "could not enqueue item");
     return false;
   }
+
+  atomic_store(&self->ready, true);
 
   return true;
 }
@@ -445,13 +525,17 @@ void *notifier1(void *args)
   observer_t *observer = (observer_t *)args;
   int *item = NULL;
 
-  while (true)
+  while (false == atomic_load(&observer->observable->done) ||
+         false == ts_queue_empty(observer->observable->queue))
   {
+    observable_select(observer->observable);
+
     while (NULL != (item = ts_queue_dequeue(observer->observable->queue)))
     {
       printf("%d\n", *item);
-      sleep(0.1);
     }
+
+    observable_clear(observer->observable);
   }
 
   return NULL;
@@ -462,16 +546,25 @@ void *notifier2(void *args)
   observer_t *observer = (observer_t *)args;
   int *item = NULL;
 
-  while (true)
+  while (false == atomic_load(&observer->observable->done) ||
+         false == ts_queue_empty(observer->observable->queue))
   {
+    observable_select(observer->observable);
+
     while (NULL != (item = ts_queue_dequeue(observer->observable->queue)))
     {
       printf("%d\n", *item);
     }
+
+    observable_clear(observer->observable);
   }
 
   return NULL;
 }
+
+#define QUEUE_CAPACITY 10
+#define MAX_OBSERVERS   5
+#define MAX_THREADS     2
 
 int main(void)
 {
@@ -479,7 +572,7 @@ int main(void)
   observer_t *observer2 = NULL;
 
   observable_t *observable = NULL;
-  observable = observable_new(10, 5, 2);
+  observable = observable_new(QUEUE_CAPACITY, MAX_OBSERVERS, MAX_THREADS);
 
   observer1 = observer_new(observable, &notifier1);
   observer2 = observer_new(observable, &notifier2);
@@ -496,11 +589,7 @@ int main(void)
     observable_publish(observable, i);
   }
 
-  for (i = 0; i < observable->count; i++)
-  {
-    pthread_join(observable->tids[i], NULL);
-  }
-
+  observable_shutdown(observable);
   observable_destroy(observable);
 
   return EXIT_FAILURE;
