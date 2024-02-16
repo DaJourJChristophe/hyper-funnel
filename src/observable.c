@@ -1,3 +1,4 @@
+#include "common.h"
 #include "observable.h"
 #include "observer.h"
 
@@ -13,8 +14,8 @@
 observable_t *observable_new(const size_t cap, const size_t max_observers, const size_t max_threads)
 {
   observable_t *self = NULL;
-  self = (observable_t *)calloc(1, sizeof(*self));
-  self->observers = (observer_t **)calloc(max_observers, sizeof(*self->observers));
+  self = (observable_t *)_calloc(1, sizeof(*self));
+  self->observers = (observer_t **)_calloc(max_observers, sizeof(*self->observers));
 
   self->queue = ts_queue_new(cap);
 
@@ -48,12 +49,10 @@ void observable_destroy(observable_t *self)
         observer_destroy(observer);
       }
 
-      free(self->observers);
-      self->observers = NULL;
+      __free(self->observers);
     }
 
-    free(self);
-    self = NULL;
+    __free(self);
   }
 }
 
