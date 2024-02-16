@@ -1,0 +1,6 @@
+[submodule "deps/turnpike"]
+	path = deps/turnpike
+	url = git@github.com:DaJourJChristophe/turnpike.git
+[submodule "deps/jemalloc"]
+	path = deps/jemalloc
+	url = git@github.com:jemalloc/jemalloc.git

@@ -1,0 +1,15 @@
+*.a
+*.o
+*.so
+*.so.*
+
+.vscode/
+
+bin/*
+!bin/.keep
+
+include/jemalloc
+include/turnpike
+
+libexec/*
+!libexec/.keep
