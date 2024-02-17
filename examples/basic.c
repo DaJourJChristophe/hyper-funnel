@@ -1,3 +1,4 @@
+#include "channel.h"
 #include "observable.h"
 #include "observer.h"
 
@@ -12,13 +13,14 @@ void *notifier1(void *args)
   int *item = NULL;
 
   while (false == atomic_load(&observer->observable->done) ||
-         false == ts_queue_empty(observer->observable->queue))
+         false == ts_queue_empty(observer->channel->downstream))
   {
     observable_select(observer->observable);
 
-    while (NULL != (item = ts_queue_dequeue(observer->observable->queue)))
+    while (NULL != (item = ts_queue_dequeue(observer->channel->downstream)))
     {
       printf("%d\n", *item);
+      ts_queue_enqueue(observer->channel->upstream, 1);
     }
 
     observable_clear(observer->observable);
@@ -33,13 +35,14 @@ void *notifier2(void *args)
   int *item = NULL;
 
   while (false == atomic_load(&observer->observable->done) ||
-         false == ts_queue_empty(observer->observable->queue))
+         false == ts_queue_empty(observer->channel->downstream))
   {
     observable_select(observer->observable);
 
-    while (NULL != (item = ts_queue_dequeue(observer->observable->queue)))
+    while (NULL != (item = ts_queue_dequeue(observer->channel->downstream)))
     {
       printf("%d\n", *item);
+      ts_queue_enqueue(observer->channel->upstream, 1);
     }
 
     observable_clear(observer->observable);
@@ -60,8 +63,8 @@ int main(void)
   observable_t *observable = NULL;
   observable = observable_new(QUEUE_CAPACITY, MAX_OBSERVERS, MAX_THREADS);
 
-  observer1 = observer_new(observable, &notifier1);
-  observer2 = observer_new(observable, &notifier2);
+  observer1 = observer_new(observable, observable->channels[0], &notifier1);
+  observer2 = observer_new(observable, observable->channels[1], &notifier2);
 
   observable_subscribe(observable, observer1);
   observable_subscribe(observable, observer2);

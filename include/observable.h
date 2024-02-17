@@ -1,6 +1,8 @@
 #ifndef HYPER_FUNNEL__OBSERVABLE_H
 #define HYPER_FUNNEL__OBSERVABLE_H
 
+#include "channel.h"
+#include "load_balance.h"
 #include "observer.h"
 
 #include <turnpike/tsqueue.h>
@@ -13,8 +15,10 @@ struct observable
 {
   ts_queue_t *queue;
   size_t cap;
+  bidirectional_channel_t **channels;
   observer_t **observers;
   size_t max_observers;
+  load_balancer_t *lb;
   uint64_t count;
   size_t max_threads;
   atomic_bool done;

@@ -16,15 +16,24 @@ observable_t *observable_new(const size_t cap, const size_t max_observers, const
   observable_t *self = NULL;
   self = (observable_t *)_calloc(1, sizeof(*self));
   self->observers = (observer_t **)_calloc(max_observers, sizeof(*self->observers));
+  self->channels = (bidirectional_channel_t **)_calloc(max_observers, sizeof(*self->channels));
+
+  uint64_t i;
+
+  for (i = 0; i < max_observers; i++)
+  {
+    self->channels[i] = bidirectional_channel_new(cap, cap);
+  }
 
   self->queue = ts_queue_new(cap);
+  self->lb = load_balancer_new(max_observers);
 
   atomic_init(&self->done, false);
   atomic_init(&self->ready, false);
 
   self->max_observers = max_observers;
-  self->max_threads;
-  self->cap;
+  self->max_threads = max_threads;
+  self->cap = cap;
 
   return self;
 }
@@ -36,6 +45,24 @@ void observable_destroy(observable_t *self)
     if (self->queue != NULL)
     {
       ts_queue_destroy(self->queue);
+    }
+
+    if (self->channels != NULL)
+    {
+      uint64_t i;
+
+      for (i = 0; i < self->max_observers; i++)
+      {
+        bidirectional_channel_destroy(self->channels[i]);
+      }
+
+      free(self->channels);
+      self->channels = NULL;
+    }
+
+    if (self->lb != NULL)
+    {
+      load_balancer_destroy(self->lb);
     }
 
     if (self->observers != NULL)
@@ -100,7 +127,7 @@ bool observable_publish(observable_t *self, const int item)
     return false;
   }
 
-  if (false == ts_queue_enqueue(self->queue, item))
+  if (false == load_balancer_publish(self->lb, self->channels, item))
   {
     fprintf(stderr, "%s(): %s\n", __func__, "could not enqueue item");
     return false;
