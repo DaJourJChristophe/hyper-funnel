@@ -19,7 +19,7 @@ void *notifier1(void *args)
 
     while (NULL != (item = ts_queue_dequeue(observer->channel->downstream)))
     {
-      printf("%d\n", *item);
+      printf("worker #1: %d\n", *item);
       ts_queue_enqueue(observer->channel->upstream, 1);
     }
 
@@ -41,7 +41,7 @@ void *notifier2(void *args)
 
     while (NULL != (item = ts_queue_dequeue(observer->channel->downstream)))
     {
-      printf("%d\n", *item);
+      printf("worker #2: %d\n", *item);
       ts_queue_enqueue(observer->channel->upstream, 1);
     }
 
@@ -51,8 +51,8 @@ void *notifier2(void *args)
   return NULL;
 }
 
-#define QUEUE_CAPACITY 10
-#define MAX_OBSERVERS   5
+#define QUEUE_CAPACITY  100000
+#define MAX_OBSERVERS   2
 #define MAX_THREADS     2
 
 int main(void)
@@ -86,9 +86,13 @@ int main(void)
     }
   }
 
-  for (i = 1; i < 6; i++)
+  for (i = 1; i < 100000; i++)
   {
-    observable_publish(observable, i);
+    if (false == observable_publish(observable, i))
+    {
+      fprintf(stderr, "%s(): %s\n", __func__, "could not publish to workers");
+      exit(EXIT_FAILURE);
+    }
   }
 
   observable_shutdown(observable);
