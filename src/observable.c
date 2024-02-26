@@ -1,8 +1,9 @@
 #include "common.h"
 #include "observable.h"
 #include "observer.h"
+#include "scheduler.h"
 
-#include <turnpike/tsqueue.h>
+#include <turnpike/bipartite.h>
 
 #include <stdatomic.h>
 #include <inttypes.h>
@@ -10,6 +11,10 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+#define COMMAND_QUEUE_CAPACITY       4096
+#define DATA_QUEUE_CAPACITY          4096
+#define DATA_QUEUE_SEGMENT_LENGTH    sizeof(int)
 
 observable_t *observable_new(const size_t cap, const size_t max_observers, const size_t max_threads)
 {
@@ -25,11 +30,21 @@ observable_t *observable_new(const size_t cap, const size_t max_observers, const
     self->channels[i] = bidirectional_channel_new(cap, cap);
   }
 
-  self->queue = ts_queue_new(cap);
-  self->lb = load_balancer_new(max_observers);
+  self->queue = bipartite_queue_new(cap, 0);
+  self->lb = load_balancer_new(cap, max_observers);
+  self->scheduler = scheduler_new((2 * max_observers), COMMAND_QUEUE_CAPACITY, DATA_QUEUE_CAPACITY, NULL);
+
+  for (i = 0; i < max_observers; i++)
+  {
+    scheduler_add(self->scheduler, self->channels[i]->downstream);
+  }
+
+  for (i = 0; i < max_observers; i++)
+  {
+    scheduler_add(self->scheduler, self->channels[i]->upstream);
+  }
 
   atomic_init(&self->done, false);
-  atomic_init(&self->ready, false);
 
   self->max_observers = max_observers;
   self->max_threads = max_threads;
@@ -44,7 +59,7 @@ void observable_destroy(observable_t *self)
   {
     if (self->queue != NULL)
     {
-      ts_queue_destroy(self->queue);
+      bipartite_queue_destroy(self->queue);
     }
 
     if (self->channels != NULL)
@@ -83,14 +98,14 @@ void observable_destroy(observable_t *self)
   }
 }
 
-void observable_select(observable_t *self)
+void observable_select(observable_t *self, observer_t *observer)
 {
   if (self == NULL)
   {
     return;
   }
 loop:
-  if (true == atomic_load(&self->ready) ||
+  if (true == atomic_load(&observer->ready) ||
       true == atomic_load(&self->done))
   {
     goto done;
@@ -100,16 +115,6 @@ done:
   return;
 }
 
-void observable_clear(observable_t *self)
-{
-  if (self == NULL)
-  {
-    return;
-  }
-
-  atomic_store(&self->ready, false);
-}
-
 void observable_shutdown(observable_t *self)
 {
   if (self == NULL)
@@ -117,23 +122,45 @@ void observable_shutdown(observable_t *self)
     return;
   }
 
-  atomic_store(&self->done, true);
+  bool expected = false;
+  uint64_t i;
+
+  for (i = 0; i < self->max_observers; i++)
+  {
+loop:
+    if (false == scheduler_empty(self->scheduler, i))
+    {
+      goto loop;
+    }
+  }
+
+  atomic_compare_exchange_strong(&self->done, &expected, true);
 }
 
-bool observable_publish(observable_t *self, const int item)
+bool observable_cleanup(observable_t *self)
 {
   if (self == NULL)
   {
     return false;
   }
 
-  if (false == load_balancer_publish(self->lb, self->channels, item))
+  load_balancer_wait(self->lb, self, self->scheduler);
+
+  return true;
+}
+
+bool observable_publish(observable_t *self, const void *data)
+{
+  if (self == NULL)
+  {
+    return false;
+  }
+
+  if (false == load_balancer_publish(self->lb, self, self->scheduler, self->channels, data))
   {
     fprintf(stderr, "%s(): %s\n", __func__, "could not enqueue item");
     return false;
   }
-
-  atomic_store(&self->ready, true);
 
   return true;
 }

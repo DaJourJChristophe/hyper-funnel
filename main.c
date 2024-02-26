@@ -1,93 +1,307 @@
-#include <turnpike/bipartite.h>
-#include <turnpike/queue.h>
+#include "command.h"
+#include "lock.h"
+#include "queue.h"
 
-#include <inttypes.h>
+#include <math.h>
+
 #include <pthread.h>
-#include <semaphore.h>
-#include <stddef.h>
+
+#include <stdatomic.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 
-#define COMMAND_QUEUE_CAPACITY       4096
-#define DATA_QUEUE_CAPACITY          4096
-#define DATA_QUEUE_SEGMENT_LENGTH    sizeof(int)
+#define MAX_INACTIVE_SPINS 100
 
-typedef void *(*command_t)(bipartite_queue_t *queue, int *type, const void *data, const bool probe);
-
-enum
-{
-  COMMAND_TYPE_WRITE,
-  COMMAND_TYPE_READ,
-};
-
-/**
- * @note This method is inherently protected by the scheduler.
- */
-void *command_read(bipartite_queue_t *queue, int *type, const void __attribute__ ((unused)) *data, const bool probe)
-{
-  *type = COMMAND_TYPE_READ;
-  if (probe) { return NULL; }
-  return bipartite_queue_dequeue(queue);
-}
-
-/**
- * @note This method is inherently protected by the scheduler.
- */
-void *command_write(bipartite_queue_t *queue, int *type, const void *data, const bool probe)
-{
-  *type = COMMAND_TYPE_WRITE;
-  if (probe) { return NULL; }
-  bool *result = NULL;
-  result = (bool *)calloc(1, sizeof(*result));
-  *result = bipartite_queue_enqueue(queue, data);
-  return (void *)result;
-}
+#define MAX_ALLOWED_WORKLOAD(cap) (uint64_t)(cap * (double)0.1)
 
 struct scheduler
 {
-  bipartite_queue_t *command_queue;
-  bipartite_queue_t *data_queue;
-  bipartite_queue_t *target_queue;
-  sem_t lock;
-  uint64_t *distribution;
-  size_t state_count;
+  command_queue_t *inbound;
+  command_queue_t *outbound;
+  combo_lock_t lock;
 };
 
 typedef struct scheduler scheduler_t;
 
-scheduler_t *scheduler_new(const size_t max_commands, const size_t max_data, bipartite_queue_t *target)
+void scheduler_schedule_enqueue(scheduler_t *self, const uint64_t id, command_t cmd)
 {
-  scheduler_t *self = NULL;
-  self = (scheduler_t *)calloc(1, sizeof(*self));
-  self->command_queue = bipartite_queue_new(max_commands, sizeof(uintptr_t));
-  self->data_queue = bipartite_queue_new(max_data, target->len);
-  self->distribution = (uint64_t *)calloc(2UL, sizeof(*self->distribution));
-  sem_init(&self->lock, 0, 1);
-  self->target_queue = target;
-  self->state_count = 2UL;
+  if (self == NULL)
+  {
+    fprintf(stderr, "%s(): %s\n", __func__, "null pointer exception");
+    exit(EXIT_FAILURE);
+  }
+
+  command_queue_t *queue = NULL;
+
+  combo_lock(&self->lock, id);
+  // combo_lock(&self->lock, id, &combo_lock_cycle, &combo_lock_stepper, self);
+
+  if (false == command_queue_enqueue(self->inbound, cmd))
+  {
+    fprintf(stderr, "%s(): %s\n", __func__, "could not enqueue into command queue");
+    exit(EXIT_FAILURE);
+  }
+}
+
+void scheduler_schedule_dequeue(scheduler_t *self, const uint64_t id, command_t cmd)
+{
+  if (self == NULL)
+  {
+    fprintf(stderr, "%s(): %s\n", __func__, "null pointer exception");
+    exit(EXIT_FAILURE);
+  }
+
+  command_queue_t *queue = NULL;
+
+  combo_lock(&self->lock, id);
+  // combo_lock(&self->lock, id, &combo_lock_cycle, &combo_lock_stepper, self);
+
+  if (false == command_queue_enqueue(self->outbound, cmd))
+  {
+    fprintf(stderr, "%s(): %s\n", __func__, "could not enqueue into command queue");
+    exit(EXIT_FAILURE);
+  }
+}
+
+// #define SCHEDULER_FAILURE_NODEFECT      0
+// #define SCHEDULER_FAILURE_EARLY_RELEASE 1
+
+// void scheduler_schedule_dequeue_limit(scheduler_t *self, int *failure, const uint64_t id, const uint64_t bound, command_t cmd)
+// {
+//   if (self == NULL)
+//   {
+//     fprintf(stderr, "%s(): %s\n", __func__, "null pointer exception");
+//     exit(EXIT_FAILURE);
+//   }
+
+//   command_queue_t *queue = NULL;
+
+//   combo_lock(&self->lock, id);
+//   // if (false == combo_lock_limit(&self->lock, id, &combo_lock_cycle, &combo_lock_stepper, bound, self))
+//   // {
+//   //   *failure = SCHEDULER_FAILURE_EARLY_RELEASE;
+//   //   return;
+//   // }
+
+//   if (false == command_queue_enqueue(self->outbound, cmd))
+//   {
+//     fprintf(stderr, "%s(): %s\n", __func__, "could not enqueue into command queue");
+//     exit(EXIT_FAILURE);
+//   }
+
+//   *failure = SCHEDULER_FAILURE_NODEFECT;
+// }
+
+command_t scheduler_execute_enqueue(scheduler_t *self, const uint64_t id)
+{
+  if (self == NULL)
+  {
+    fprintf(stderr, "%s(): %s\n", __func__, "null pointer exception");
+    exit(EXIT_FAILURE);
+  }
+
+  command_t cmd = NULL;
+
+  combo_lock(&self->lock, id);
+  // combo_lock(&self->lock, id, &combo_lock_cycle, &combo_lock_stepper, self);
+
+  cmd = command_queue_dequeue(self->inbound);
+
+  if (cmd == NULL)
+  {
+    // combo_try_unlock(&self->lock, id, &combo_lock_stepper, self);
+    return NULL;
+  }
+
+  return cmd;
+}
+
+command_t scheduler_execute_dequeue(scheduler_t *self, const uint64_t id)
+{
+  if (self == NULL)
+  {
+    fprintf(stderr, "%s(): %s\n", __func__, "null pointer exception");
+    exit(EXIT_FAILURE);
+  }
+
+  command_t cmd = NULL;
+
+  combo_lock(&self->lock, id);
+  // combo_lock(&self->lock, id, &combo_lock_cycle, &combo_lock_stepper, self);
+
+  cmd = command_queue_dequeue(self->outbound);
+
+  if (cmd == NULL)
+  {
+    // combo_try_unlock(&self->lock, id, &combo_lock_stepper, self);
+    return NULL;
+  }
+
+  return cmd;
+}
+
+// command_t scheduler_execute_dequeue_limit(scheduler_t *self, int *failure, const uint64_t id, const uint64_t bound)
+// {
+//   if (self == NULL)
+//   {
+//     fprintf(stderr, "%s(): %s\n", __func__, "null pointer exception");
+//     exit(EXIT_FAILURE);
+//   }
+
+//   command_t cmd = NULL;
+
+//   combo_lock(&self->lock, id);
+
+//   // if (false == combo_lock_limit(&self->lock, id, &combo_lock_cycle, &combo_lock_stepper, bound, self))
+//   // {
+//   //   *failure = SCHEDULER_FAILURE_EARLY_RELEASE;
+//   //   return NULL;
+//   // }
+
+//   cmd = command_queue_dequeue(self->outbound);
+
+//   if (cmd == NULL)
+//   {
+//     // combo_try_unlock(&self->lock, id, &combo_lock_stepper, self);
+//     return NULL;
+//   }
+
+//   *failure = SCHEDULER_FAILURE_NODEFECT;
+//   return cmd;
+// }
+
+struct observable;
+
+struct observer;
+
+struct exchange
+{
+  struct observer *observer;
+  struct observable *observable;
+  queue_t *queue;
+  scheduler_t *sched;
+};
+
+typedef struct exchange exchange_t;
+
+queue_t *observable_access(struct observable *self);
+
+void exchange_enqueue(exchange_t *self)
+{
+  if (self == NULL)
+  {
+    fprintf(stderr, "%s(): %s\n", __func__, "null pointer exception");
+    exit(EXIT_FAILURE);
+  }
+
+  callback_t callback = NULL;
+  command_t cmd = NULL;
+
+  callback = queue_dequeue(observable_access(self->observable));
+
+  /**
+   * @warning This is the Critical Moment! This is the moment when
+   *          a producer and consumer come together. This is the
+   *          moment when this approach will experience the most
+   *          idle blocking. In a non-blocking scenario, this is the
+   *          moment when the most state failures will occur.
+   */
+
+  bool *result = NULL;
+
+  scheduler_schedule_enqueue(self->sched, 1UL, command_enqueue);
+
+  cmd = scheduler_execute_enqueue(self->sched, 1UL);
+
+  if (cmd == NULL)
+  {
+    fprintf(stderr, "%s(): %s\n", __func__, "did not receive a command back fro the scheduler");
+    exit(EXIT_FAILURE);
+  }
+
+  result = (bool *)cmd(self->queue, callback);
+
+  if (result == NULL)
+  {
+    fprintf(stderr, "%s(): %s\n", __func__, "value error: null pointer exception");
+    exit(EXIT_FAILURE);
+  }
+
+  if (false == result)
+  {
+    fprintf(stderr, "%s(): %s\n", __func__, "could not enqueue into target queue");
+    exit(EXIT_FAILURE);
+  }
+
+  free(result);
+  result = NULL;
+}
+
+struct observer
+{
+  uint64_t id;
+  queue_t *queue;
+  scheduler_t sched;
+  exchange_t exchange;
+  atomic_int done;
+};
+
+typedef struct observer observer_t;
+
+observer_t *observer_new(struct observable *observable, const size_t cap, const uint64_t id)
+{
+  observer_t *self = NULL;
+  self = (observer_t *)calloc(1UL, sizeof(*self));
+  if (self == NULL)
+  {
+    fprintf(stderr, "%s(): %s\n", __func__, "memory error");
+    exit(EXIT_FAILURE);
+  }
+
+  self->queue = queue_new(cap);
+
+  self->sched.inbound = command_queue_new(cap);
+  self->sched.outbound = command_queue_new(cap);
+
+  const uint64_t m = (1UL /*producers*/ + 1UL /*consumers*/);
+  combo_lock_init(&self->sched.lock, MAX_INACTIVE_SPINS, MAX_ALLOWED_WORKLOAD(cap), m);
+
+  atomic_init(&self->done, 0);
+
+  self->exchange.observer = self;
+  self->exchange.queue = self->queue;
+  self->exchange.observable = observable;
+  self->exchange.sched = &self->sched;
+
+  self->id = id;
   return self;
 }
 
-void scheduler_destroy(scheduler_t *self)
+void observer_destroy(observer_t *self)
 {
   if (self != NULL)
   {
-    if (self->command_queue != NULL)
+    if (self->queue != NULL)
     {
-      bipartite_queue_destroy(self->command_queue);
+      queue_destroy(self->queue);
+      self->queue = NULL;
     }
 
-    if (self->data_queue != NULL)
+    if (self->sched.inbound != NULL)
     {
-      bipartite_queue_destroy(self->data_queue);
+      command_queue_destroy(self->sched.inbound);
+      self->sched.inbound = NULL;
     }
 
-    if (self->distribution != NULL)
+    if (self->sched.outbound != NULL)
     {
-      free(self->distribution);
-      self->distribution = NULL;
+      command_queue_destroy(self->sched.outbound);
+      self->sched.outbound = NULL;
     }
 
     free(self);
@@ -95,307 +309,302 @@ void scheduler_destroy(scheduler_t *self)
   }
 }
 
-/**
- * @note This method is not inherently protected by the scheduler.
- */
-static void scheduler_handle(scheduler_t *self, const int type, const void *data)
+uint64_t observer_get_id(observer_t *self);
+
+void observer_notify(observer_t *self)
 {
-  switch (type)
+  if (self == NULL)
   {
-    case COMMAND_TYPE_READ:
-      if (data != NULL)
-      {
-        printf("%d\n", *(int *)data);
-      }
-      break;
-
-    case COMMAND_TYPE_WRITE:
-      if (data != NULL)
-      {
-        if (false == *(bool *)data)
-        {
-          fprintf(stderr, "%s(): %s\n", "could not enqueue into data queue");
-          exit(EXIT_FAILURE);
-        }
-
-        break;
-      }
-
-      fprintf(stderr, "%s(): %s\n", __func__, "data is null on command write");
-      break;
-
-    default:
-      fprintf(stderr, "%s(): %s\n", __func__, "unknown command type");
-      break;
-  }
-}
-
-#define SCHEDULER_COMMAND_PROBE_TRUE  true
-#define SCHEDULER_COMMAND_PROBE_FALSE false
-
-const command_t *command_writer = &(command_t){&command_write};
-const command_t *command_reader = &(command_t){&command_read };
-
-static void scheduler_execute(scheduler_t *self)
-{
-  command_t fn = NULL;
-  uintptr_t *addr = NULL;
-  void *data = NULL;
-  void *result = NULL;
-  int type = 0;
-  bool skip_execution = false;
-
-  if (sem_wait(&self->lock) < 0)
-  {
-    fprintf(stderr, "%s(): %s\n", "could not block on sem_wait()");
+    fprintf(stderr, "%s(): %s\n", __func__, "null pointer exception");
     exit(EXIT_FAILURE);
   }
 
-  addr = bipartite_queue_dequeue(self->command_queue);
+  exchange_enqueue(&self->exchange);
+}
 
-  if (sem_post(&self->lock) < 0)
+uint64_t observer_get_id(observer_t *self)
+{
+  if (self == NULL)
   {
-    fprintf(stderr, "%s(): %s\n", "could not unblock on sem_post()");
+    fprintf(stderr, "%s(): %s\n", __func__, "null pointer exception");
     exit(EXIT_FAILURE);
   }
 
-  while (NULL != addr)
-  {
-    fn = (command_t)*addr;
-
-    if (sem_wait(&self->lock) < 0)
-    {
-      fprintf(stderr, "%s(): %s\n", "could not block on sem_wait()");
-      exit(EXIT_FAILURE);
-    }
-
-    fn(self->target_queue, &type, NULL, SCHEDULER_COMMAND_PROBE_TRUE);
-    switch (type)
-    {
-      case COMMAND_TYPE_READ:
-        if (self->distribution[0] < self->distribution[1])
-        {
-          data = bipartite_queue_dequeue(self->data_queue);
-          bipartite_queue_enqueue(self->data_queue, data);
-          bipartite_queue_enqueue(self->command_queue, addr);
-          skip_execution = true;
-          break;
-        }
-
-        self->distribution[0]--;
-        self->distribution[1]--;
-        break;
-
-      case COMMAND_TYPE_WRITE:
-        break;
-
-      default:
-        fprintf(stderr, "%s(): %s\n", __func__, "unknown command type");
-        break;
-    }
-
-    if (false == skip_execution)
-    {
-      data = bipartite_queue_dequeue(self->data_queue);
-      result = fn(self->target_queue, &type, data, SCHEDULER_COMMAND_PROBE_FALSE);
-    }
-
-    addr = bipartite_queue_dequeue(self->command_queue);
-
-    if (sem_post(&self->lock) < 0)
-    {
-      fprintf(stderr, "%s(): %s\n", "could not unblock on sem_post()");
-      exit(EXIT_FAILURE);
-    }
-
-    if (false == skip_execution)
-    {
-      scheduler_handle(self, type, result);
-    }
-
-    type = 0;
-    data = NULL;
-    result = NULL;
-    skip_execution = false;
-  }
+  return self->id;
 }
 
-bool scheduler_enqueue(scheduler_t *self, const void *data)
+struct load_balancer
 {
-  bool result = false;
+  size_t n;
+  uint64_t i;
+};
 
-  switch (0)
+typedef struct load_balancer load_balancer_t;
+
+void load_balancer_next(load_balancer_t *self)
+{
+  if (self == NULL)
   {
-    case 0:
-      if (sem_trywait(&self->lock) < 0)
-      {
-        break;
-      }
-
-      result = bipartite_queue_enqueue(self->data_queue, data);
-      if (false == result)
-      {
-        break;
-      }
-
-      result = bipartite_queue_enqueue(self->command_queue, command_writer);
-      if (false == result)
-      {
-        break;
-      }
-
-      self->distribution[0]++;
-
-      if (sem_post(&self->lock) < 0)
-      {
-        fprintf(stderr, "%s(): %s\n", "could not unblock on sem_post()");
-        exit(EXIT_FAILURE);
-      }
-
-    case 1:
-      scheduler_execute(self);
-
-    default: break;
+    fprintf(stderr, "%s(): %s\n", __func__, "null pointer exception");
+    exit(EXIT_FAILURE);
   }
 
-  return result;
+  self->i = (1UL + self->i) % self->n;
 }
 
-bool scheduler_dequeue(scheduler_t *self)
+uint64_t load_balancer_get_current_index(load_balancer_t *self)
 {
-  bool result = false;
-
-  switch (0)
+  if (self == NULL)
   {
-    case 0:
-      if (sem_trywait(&self->lock) < 0)
-      {
-        break;
-      }
-
-      result = bipartite_queue_enqueue(self->data_queue, &(int){0});
-      if (false == result)
-      {
-        break;
-      }
-
-      result = bipartite_queue_enqueue(self->command_queue, command_reader);
-      if (false == result)
-      {
-        break;
-      }
-
-      self->distribution[1]++;
-
-      if (sem_post(&self->lock) < 0)
-      {
-        fprintf(stderr, "%s(): %s\n", "could not unblock on sem_post()");
-        exit(EXIT_FAILURE);
-      }
-
-    case 1:
-      scheduler_execute(self);
-
-    default: break;
+    fprintf(stderr, "%s(): %s\n", __func__, "null pointer exception");
+    exit(EXIT_FAILURE);
   }
 
-  return result;
+  return self->i;
 }
 
-void *worker1(void *args)
+struct publisher
 {
-  scheduler_t *scheduler = NULL;
-  scheduler = (scheduler_t *)args;
+  load_balancer_t lb;
+};
 
-  const size_t n = 100;
-  queue_t *queue = NULL;
-  int *item = NULL;
+typedef struct publisher publisher_t;
 
-  int x = 1;
-  int y = 0;
-
-  queue = queue_new(n * sizeof(int), sizeof(int));
-
-  for (int i = 0; i < n; i++)
+void publisher_next(publisher_t *self)
+{
+  if (self == NULL)
   {
-    if (false == scheduler_enqueue(scheduler, &x))
-    {
-      if (false == queue_enqueue(queue, &x))
-      {
-        fprintf(stderr, "%s(): %s\n", "could not enqueue into local queue");
-        exit(EXIT_FAILURE);
-      }
-    }
+    fprintf(stderr, "%s(): %s\n", __func__, "null pointer exception");
+    exit(EXIT_FAILURE);
   }
 
-  // Do something else ...
+  load_balancer_next(&self->lb);
+}
 
-  while (NULL != (item = queue_dequeue(queue)))
+uint64_t publisher_get_current_index(publisher_t *self)
+{
+  if (self == NULL)
   {
-    y = *item;
-
-    if (false == scheduler_enqueue(scheduler, &y))
-    {
-      if (false == queue_enqueue(queue, &y))
-      {
-        fprintf(stderr, "%s(): %s\n", "could not enqueue into local queue");
-        exit(EXIT_FAILURE);
-      }
-    }
+    fprintf(stderr, "%s(): %s\n", __func__, "null pointer exception");
+    exit(EXIT_FAILURE);
   }
 
-  queue_destroy(queue);
+  return load_balancer_get_current_index(&self->lb);
+}
+
+struct observable
+{
+  queue_t *queue;
+  observer_t **observers;
+  size_t cap;
+  uint64_t size;
+  publisher_t pub;
+};
+
+typedef struct observable observable_t;
+
+observer_t *observable_get_observer(observable_t *self, const int i)
+{
+  if (self == NULL)
+  {
+    fprintf(stderr, "%s(): %s\n", __func__, "null pointer exception");
+    exit(EXIT_FAILURE);
+  }
+
+  return self->observers[i];
+}
+
+void observable_next(observable_t *self);
+uint64_t observable_get_current_index(observable_t *self);
+
+void observable_publish(observable_t *self, callback_t callback)
+{
+  if (self == NULL)
+  {
+    fprintf(stderr, "%s(): %s\n", __func__, "null pointer exception");
+    exit(EXIT_FAILURE);
+  }
+
+  queue_enqueue(self->queue, callback);
+
+  observer_t *observer = NULL;
+
+  observer = observable_get_observer(self, observable_get_current_index(self));
+
+  observer_notify(observer);
+
+  observable_next(self);
+}
+
+queue_t *observable_access(observable_t *self)
+{
+  if (self == NULL)
+  {
+    fprintf(stderr, "%s(): %s\n", __func__, "null pointer exception");
+    exit(EXIT_FAILURE);
+  }
+
+  return self->queue;
+}
+
+void observable_next(observable_t *self)
+{
+  if (self == NULL)
+  {
+    fprintf(stderr, "%s(): %s\n", __func__, "null pointer exception");
+    exit(EXIT_FAILURE);
+  }
+
+  publisher_next(&self->pub);
+}
+
+uint64_t observable_get_current_index(observable_t *self)
+{
+  if (self == NULL)
+  {
+    fprintf(stderr, "%s(): %s\n", __func__, "null pointer exception");
+    exit(EXIT_FAILURE);
+  }
+
+  return publisher_get_current_index(&self->pub);
+}
+
+void *thread(void *args)
+{
+  observer_t *observer = NULL;
+  observer = (observer_t *)args;
+
+  callback_t callback = NULL;
+  command_t cmd = NULL;
+
+  int failure = 0;
+
+  while (true)
+  {
+    if (1 == atomic_load(&observer->done))
+    {
+      break;
+    }
+
+    while (true)
+    {
+      // scheduler_schedule_dequeue_limit(&observer->sched, &failure, 0UL, 10UL, command_dequeue);
+      scheduler_schedule_dequeue(&observer->sched, 0UL, command_dequeue);
+
+      // if (failure == SCHEDULER_FAILURE_EARLY_RELEASE)
+      // {
+      //   break;
+      // }
+
+      // cmd = scheduler_execute_dequeue_limit(&observer->sched, &failure, 0UL, 10UL);
+      cmd = scheduler_execute_dequeue(&observer->sched, 0UL);
+
+      // if (failure == SCHEDULER_FAILURE_EARLY_RELEASE)
+      // {
+      //   break;
+      // }
+
+      if (cmd == NULL)
+      {
+        fprintf(stderr, "%s(): %s\n", __func__, "did not receive a command back from the scheduler");
+        exit(EXIT_FAILURE);
+      }
+
+      callback = (callback_t)cmd(observer->queue, NULL);
+
+      if (callback == NULL)
+      {
+        break;
+      }
+
+      callback(1);
+    }
+  }
 
   return NULL;
 }
 
-void *worker2(void *args)
+// volatile int sum = 0UL;
+// atomic_int sum;
+
+void stuff(const int i)
 {
-  scheduler_t *scheduler = NULL;
-  scheduler = (scheduler_t *)args;
-
-  int failed = 0;
-
-  for (int i = 0; i < 100; i++)
-  {
-    if (false == scheduler_dequeue(scheduler))
-    {
-      failed++;
-    }
-  }
-
-  while (failed > 0)
-  {
-    if (false == scheduler_dequeue(scheduler))
-    {
-      continue;
-    }
-
-    failed--;
-  }
-
-  return NULL;
+  double x = 1.0;
+  x = exp(x);
+  (void)x;
+  // atomic_fetch_add(&sum, i);
+  // sum += i;
 }
+
+#define MAX_WORKLOAD 1000000
+
+#define MAX_WORKERS 2
+#define MAX_THREADS 2
 
 int main(void)
 {
-  scheduler_t *scheduler = NULL;
-  bipartite_queue_t *queue = NULL;
+  observable_t observable;
+  uint64_t i;
 
-  pthread_t worker_1;
-  pthread_t worker_2;
+  observable.queue = queue_new(MAX_WORKLOAD);
 
-  queue = bipartite_queue_new(DATA_QUEUE_CAPACITY, DATA_QUEUE_SEGMENT_LENGTH);
-  scheduler = scheduler_new(COMMAND_QUEUE_CAPACITY, DATA_QUEUE_CAPACITY, queue);
+  observable.cap = MAX_WORKERS;
+  observable.observers = (observer_t **)calloc(observable.cap, sizeof(*observable.observers));
 
-  pthread_create(&worker_1, NULL, &worker1, scheduler);
-  pthread_create(&worker_2, NULL, &worker2, scheduler);
+  for (i = 0; i < observable.cap; i++)
+  {
+    observable.observers[i] = observer_new(&observable, MAX_WORKLOAD, i);
+  }
 
-  pthread_join(worker_1, NULL);
-  pthread_join(worker_2, NULL);
+  observable.pub.lb.n = MAX_WORKERS;
+  observable.pub.lb.i = 0UL;
 
-  scheduler_destroy(scheduler);
-  bipartite_queue_destroy(queue);
+  pthread_t tids[MAX_THREADS];
+  memset(tids, 0, MAX_THREADS * sizeof(*tids));
 
-  return EXIT_SUCCESS;
+  for (i = 0; i < MAX_THREADS; i++)
+  {
+    if (pthread_create(&tids[i], NULL, &thread, observable_get_observer(&observable, i)) < 0)
+    {
+      fprintf(stderr, "%s(): %s\n", __func__, "could not create thread");
+      exit(EXIT_FAILURE);
+    }
+  }
+
+  clock_t start;
+  clock_t end;
+
+  start = clock();
+
+  for (i = 0; i < MAX_WORKLOAD; i++)
+  {
+    observable_publish(&observable, &stuff);
+  }
+
+  observer_t *observer = NULL;
+
+  for (i = 0; i < MAX_WORKERS; i++)
+  {
+    observer = observable_get_observer(&observable, i);
+    atomic_store(&observer->done, 1);
+  }
+
+  for (i = 0; i < MAX_THREADS; i++)
+  {
+    if (pthread_join(tids[i], NULL) < 0)
+    {
+      fprintf(stderr, "%s(): %s\n", __func__, "could not join thread");
+      exit(EXIT_FAILURE);
+    }
+  }
+
+  end = clock();
+
+  const double duration = (double)(end - start) / (double)CLOCKS_PER_SEC;
+
+  printf("%.15f\n", duration);
+
+  return 0;
 }
+
+

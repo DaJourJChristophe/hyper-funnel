@@ -1,12 +1,12 @@
 #ifndef HYPER_FUNNEL__CHANNEL_H
 #define HYPER_FUNNEL__CHANNEL_H
 
-#include <turnpike/tsqueue.h>
+#include <turnpike/bipartite.h>
 
 struct bidirectional_channel
 {
-  ts_queue_t *downstream;
-  ts_queue_t *upstream;
+  bipartite_queue_t *downstream;
+  bipartite_queue_t *upstream;
 };
 
 typedef struct bidirectional_channel bidirectional_channel_t;
